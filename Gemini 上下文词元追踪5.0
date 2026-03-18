@@ -1,0 +1,342 @@
+// ==UserScript==
+// @name          Gemini 上下文词元追踪 (Gemini Context Token Tracking)
+// @namespace    http://tampermonkey.net/
+// @version      5.0
+// @description  高颜值浅色拟物风，Gemini 上下文长度与 Token 实时估算。
+// @author       cwser & Refined
+// @match        *://gemini.google.com/*
+// @grant        none
+// @run-at       document-start
+// @license      MIT
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const THRESHOLDS = { STAGE_1: 64000, STAGE_2: 128000, STAGE_3: 200000, MAX: 250000 };
+    const COLORS = { GREEN: '#1e8e3e', YELLOW: '#f9ab00', ORANGE: '#e37400', RED: '#d93025' };
+
+    // 全局物理状态机初始化
+    window.__lucidityCommittedTokens = 0;
+    window.__lucidityDraftTokens = 0; 
+    window.__lucidityDraftHistory = []; 
+    window.__lucidityCurrentlyLoadedId = null;
+    window.__lucidityLastSidebarClick = 0;
+
+    function getLucidityChatId(urlStr = location.href) {
+        try {
+            const match = new URL(urlStr).pathname.match(/\/app\/([a-zA-Z0-9_-]+)/);
+            return match ? match[1] : 'new_chat'; 
+        } catch(e) { return 'new_chat'; }
+    }
+
+    // ↓↓↓ 降维打击：侧边栏物理坐标雷达 ↓↓↓
+    document.addEventListener('mousedown', (e) => {
+        // 如果点击发生在屏幕左侧 250px 内，判定为“操作侧边栏切换历史对话”
+        if (e.clientX < 250) window.__lucidityLastSidebarClick = Date.now();
+    }, true);
+
+    // 拦截器：将颗粒度拆解至单文件级，完美支持批量拖拽的逐个撤销
+    function calculateHijackedFiles(files) {
+        if (!files || files.length === 0) return;
+        let totalAdded = 0; // 本批次总计增加的额度
+        
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            if (!file) continue;
+            
+            // 计算单体文件的体积
+            let singleFileAdded = (file.type && file.type.startsWith('image/')) ? 300 : Math.floor((file.size || 0) / 4); 
+            
+            if (singleFileAdded > 0) {
+                // 【核心修改】：将每个文件单独压入撤销栈，而不是压入总和
+                window.__lucidityDraftHistory.push(singleFileAdded); 
+                totalAdded += singleFileAdded;
+            }
+        }
+        
+        if (totalAdded > 0) {
+            window.__lucidityDraftTokens += totalAdded;
+            document.dispatchEvent(new CustomEvent('lucidity-force-update'));
+        }
+    }
+
+    // 三大事件流劫持
+    window.addEventListener('drop', (e) => {
+        if (e.dataTransfer && e.dataTransfer.files) calculateHijackedFiles(e.dataTransfer.files);
+    }, true);
+    document.addEventListener('change', (e) => {
+        if (e.target && e.target.type === 'file' && e.target.files) calculateHijackedFiles(e.target.files);
+    }, true);
+    document.addEventListener('paste', (e) => {
+        if (!e.clipboardData) return;
+        let files = [];
+        if (e.clipboardData.items) {
+            for (let i = 0; i < e.clipboardData.items.length; i++) {
+                if (e.clipboardData.items[i].kind === 'file') {
+                    const f = e.clipboardData.items[i].getAsFile();
+                    if (f) files.push(f);
+                }
+            }
+        } else if (e.clipboardData.files) files = Array.from(e.clipboardData.files);
+        if (files.length > 0) calculateHijackedFiles(files);
+    }, true);
+
+
+    function initDashboard() {
+        if (!document.body) { setTimeout(initDashboard, 100); return; }
+        if (document.getElementById('gemini-lucidity-dashboard')) return;
+
+        const dashboard = document.createElement('div');
+        dashboard.id = 'gemini-lucidity-dashboard';
+        Object.assign(dashboard.style, {
+            position: 'fixed', bottom: '24px', right: '24px', width: '230px',
+            borderRadius: '20px', backgroundColor: 'rgba(255, 255, 255, 0.85)',
+            backdropFilter: 'blur(20px) saturate(150%)', webkitBackdropFilter: 'blur(20px) saturate(150%)',
+            color: '#202124', fontFamily: '"Google Sans", "Segoe UI", system-ui, sans-serif',
+            boxShadow: '0 12px 32px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.04)',
+            zIndex: '2147483647', transition: 'transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1), height 0.3s ease',
+            border: '1px solid rgba(0, 0, 0, 0.05)', display: 'flex', flexDirection: 'column', overflow: 'hidden'
+        });
+
+        const header = document.createElement('div');
+        Object.assign(header.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 18px 8px 18px', cursor: 'grab', userSelect: 'none' });
+        
+        const titleText = document.createElement('div');
+        titleText.textContent = '✨ 状态监控';
+        titleText.style.cssText = 'font-size: 13px; font-weight: 600; color: #1a73e8; letter-spacing: 0.3px;';
+
+        const toggleBtn = document.createElement('div');
+        toggleBtn.textContent = '−';
+        toggleBtn.style.cssText = 'cursor: pointer; font-size: 18px; font-weight: 600; line-height: 1; color: #9aa0a6; padding: 0 4px; transition: color 0.2s; border-radius: 50%;';
+        toggleBtn.onmouseover = () => toggleBtn.style.color = '#202124';
+        toggleBtn.onmouseout = () => toggleBtn.style.color = '#9aa0a6';
+
+        header.appendChild(titleText);
+        header.appendChild(toggleBtn);
+
+        const undoBtn = document.createElement('div');
+        undoBtn.textContent = '撤销';
+        Object.assign(undoBtn.style, { cursor: 'pointer', fontSize: '12px', color: '#9aa0a6', padding: '2px 8px', borderRadius: '12px', border: '1px solid rgba(0,0,0,0.04)', marginLeft: '8px' });
+        undoBtn.onmouseover = () => undoBtn.style.color = '#202124';
+        undoBtn.onmouseout = () => undoBtn.style.color = '#9aa0a6';
+
+        // 按钮 1：精准草稿撤销 (绝对物理隔离)
+        undoBtn.onclick = (e) => {
+            e.stopPropagation(); 
+            if (window.__lucidityDraftHistory && window.__lucidityDraftHistory.length > 0) {
+                const lastAdded = window.__lucidityDraftHistory.pop();
+                window.__lucidityDraftTokens = Math.max(0, window.__lucidityDraftTokens - lastAdded);
+                updateLucidity();
+                
+                let displayVal = lastAdded >= 1000 ? (lastAdded/1000).toFixed(1)+'k' : lastAdded;
+                titleText.textContent = `✨ 撤销 -${displayVal}`;
+                titleText.style.color = COLORS.ORANGE;
+                setTimeout(() => { titleText.textContent = '✨ 状态监控'; titleText.style.color = '#1a73e8'; }, 1200);
+            } else {
+                titleText.textContent = '✨ 无可撤销';
+                setTimeout(() => { titleText.textContent = '✨ 状态监控'; titleText.style.color = '#1a73e8'; }, 1000);
+            }
+        };
+        undoBtn.ondblclick = (e) => e.stopPropagation();
+
+        // 按钮 2：双击标题核爆 (格式化物理扇区)
+        header.ondblclick = (e) => {
+            const currentId = getLucidityChatId();
+            window.__lucidityCommittedTokens = 0;
+            window.__lucidityDraftTokens = 0;
+            window.__lucidityDraftHistory = [];
+            if (currentId !== 'new_chat') localStorage.setItem(`lucidity_attach_${currentId}`, '0');
+            updateLucidity();
+            
+            titleText.textContent = '✨ 物理扇区已清零';
+            titleText.style.color = COLORS.RED;
+            setTimeout(() => { titleText.textContent = '✨ 状态监控'; titleText.style.color = '#1a73e8'; }, 1500);
+        };
+
+        header.appendChild(undoBtn);
+        dashboard.appendChild(header);
+
+        const contentArea = document.createElement('div');
+        contentArea.style.cssText = 'padding: 4px 18px 20px 18px; display: flex; flex-direction: column; gap: 10px;';
+        const countEl = document.createElement('div');
+        countEl.id = 'lucidity-count';
+        countEl.style.cssText = 'font-weight: 700; font-size: 24px; letter-spacing: 0.5px; color: #202124; transition: color 0.4s ease;';
+        const statusEl = document.createElement('div');
+        statusEl.id = 'lucidity-status';
+        statusEl.style.cssText = 'font-size: 12px; font-weight: 500; color: #5f6368;';
+        const progressBg = document.createElement('div');
+        progressBg.style.cssText = 'width: 100%; height: 6px; background-color: rgba(0, 0, 0, 0.06); border-radius: 6px; margin-top: 2px; overflow: hidden;';
+        const progressFill = document.createElement('div');
+        progressFill.id = 'lucidity-progress';
+        progressFill.style.cssText = 'width: 0%; height: 100%; background-color: #1e8e3e; border-radius: 6px; transition: width 0.3s ease, background-color 0.4s ease;';
+
+        progressBg.appendChild(progressFill);
+        contentArea.appendChild(countEl);
+        contentArea.appendChild(statusEl);
+        contentArea.appendChild(progressBg);
+        dashboard.appendChild(contentArea);
+        document.body.appendChild(dashboard);
+
+        let isCollapsed = false;
+        toggleBtn.onclick = () => {
+            isCollapsed = !isCollapsed;
+            contentArea.style.display = isCollapsed ? 'none' : 'flex';
+            toggleBtn.textContent = isCollapsed ? '+' : '−';
+            header.style.paddingBottom = isCollapsed ? '16px' : '8px';
+        };
+        let isDragging = false, currentX, currentY, initialX, initialY, xOffset = 0, yOffset = 0;
+        header.onmousedown = (e) => { initialX = e.clientX - xOffset; initialY = e.clientY - yOffset; isDragging = true; header.style.cursor = 'grabbing'; };
+        document.onmouseup = () => { initialX = currentX; initialY = currentY; isDragging = false; header.style.cursor = 'grab'; };
+        document.onmousemove = (e) => { if (isDragging) { e.preventDefault(); currentX = e.clientX - initialX; currentY = e.clientY - initialY; xOffset = currentX; yOffset = currentY; dashboard.style.transform = `translate(${currentX}px, ${currentY}px)`; } };
+
+        let historicalTokens = 0; 
+        let activeNodes = new Map(); 
+        let historicalArchive = new Map();
+
+        document.addEventListener('lucidity-force-update', () => updateLucidity());
+
+        function simpleHash(str) {
+            let h = 0;
+            for (let i = 0; i < Math.min(str.length, 300); i++) { h = ((h << 5) - h + str.charCodeAt(i)) | 0; }
+            return h + "_" + str.length;
+        }
+
+        function updateLucidity() {
+            const newId = getLucidityChatId(location.href);
+
+            // 核心路由引擎：仅在 URL 实际发生跳变时接管
+            if (window.__lucidityCurrentlyLoadedId !== newId) {
+                const isSidebarClick = (Date.now() - window.__lucidityLastSidebarClick) < 1000;
+
+                if (window.__lucidityCurrentlyLoadedId === 'new_chat' && newId !== 'new_chat') {
+                    // 场景 A：从新对话切到老对话
+                    if (window.__lucidityDraftTokens > 0 && !isSidebarClick) {
+                        // 动作 1：用户真的按下了发送键，且不是点击侧边栏。正式敲死定稿！
+                        window.__lucidityCommittedTokens += window.__lucidityDraftTokens;
+                        localStorage.setItem(`lucidity_attach_${newId}`, window.__lucidityCommittedTokens.toString());
+                    } else {
+                        // 动作 2：开机自动重定向（Draft是0） 或 点击侧边栏放弃了草稿。装载硬盘历史数据！
+                        window.__lucidityCommittedTokens = parseInt(localStorage.getItem(`lucidity_attach_${newId}`) || '0', 10);
+                    }
+                } else {
+                    // 场景 B：从老对话切到另一个老对话。直接装载硬盘数据。
+                    window.__lucidityCommittedTokens = newId !== 'new_chat' ? parseInt(localStorage.getItem(`lucidity_attach_${newId}`) || '0', 10) : 0;
+                }
+
+                // 路由切换完毕，执行强制清场
+                window.__lucidityDraftTokens = 0;
+                window.__lucidityDraftHistory = [];
+                historicalTokens = 0;
+                activeNodes.clear();
+                historicalArchive.clear();
+                
+                window.__lucidityCurrentlyLoadedId = newId;
+            }
+
+            const rawNodes = document.querySelectorAll('message-content, .message-content, [data-message-author-role], .query-text');
+            const nodes = Array.from(rawNodes).filter(node => {
+                let parent = node.parentElement;
+                while (parent) {
+                    if (parent.matches && parent.matches('message-content, .message-content, [data-message-author-role], .query-text')) return false;
+                    parent = parent.parentElement;
+                }
+                return true;
+            });
+
+            let currentVisibleTokens = 0;
+            let currentVisibleIds = new Set();
+
+            nodes.forEach(node => {
+                const text = node.innerText || node.textContent || "";
+                if (!text.trim()) return;
+
+                const hash = simpleHash(text);
+
+                if (!node.dataset.cid) {
+                    if (historicalArchive.has(hash)) {
+                        const oldData = historicalArchive.get(hash);
+                        node.dataset.cid = oldData.cid;
+                        historicalTokens = Math.max(0, historicalTokens - oldData.tokens);
+                        activeNodes.set(oldData.cid, { hash: hash, tokens: oldData.tokens });
+                    } else {
+                        node.dataset.cid = "cid_" + Math.random().toString(36).substring(2);
+                        
+                        // DOM级触发器：在老对话中发送了新文件。
+                        // 防御锁：绝不在 `new_chat` 阶段定稿，防止被后续的 URL 跳转再次清零！
+                        const exactId = getLucidityChatId();
+                        if (exactId !== 'new_chat' && window.__lucidityDraftTokens > 0) {
+                            window.__lucidityCommittedTokens += window.__lucidityDraftTokens;
+                            localStorage.setItem(`lucidity_attach_${exactId}`, window.__lucidityCommittedTokens.toString());
+                            window.__lucidityDraftTokens = 0;
+                            window.__lucidityDraftHistory = [];
+                        }
+                    }
+                }
+
+                const cid = node.dataset.cid;
+                currentVisibleIds.add(cid);
+
+                let nodeTokens = 0;
+                if (activeNodes.has(cid) && activeNodes.get(cid).hash === hash) {
+                    nodeTokens = activeNodes.get(cid).tokens;
+                } else {
+                    const chineseChars = text.match(/[\u4e00-\u9fa5]/g) || [];
+                    const chineseCount = chineseChars.length;
+                    const otherCount = text.length - chineseCount;
+                    nodeTokens = Math.floor((chineseCount * 0.7) + (otherCount * 0.6));
+                    activeNodes.set(cid, { hash: hash, tokens: nodeTokens });
+                    historicalArchive.set(hash, { cid: cid, tokens: nodeTokens });
+                }
+                currentVisibleTokens += nodeTokens;
+            });
+
+            for (const [cid, data] of activeNodes.entries()) {
+                if (!currentVisibleIds.has(cid)) {
+                    historicalTokens += data.tokens;
+                    activeNodes.delete(cid);
+                }
+            }
+
+            const estimatedTokens = historicalTokens + currentVisibleTokens + window.__lucidityCommittedTokens + window.__lucidityDraftTokens; 
+            updateDashboardUI(estimatedTokens);
+        }
+
+        function updateDashboardUI(tokens) {
+            const countNode = document.getElementById('lucidity-count');
+            const statusNode = document.getElementById('lucidity-status');
+            const progressNode = document.getElementById('lucidity-progress');
+            if (!countNode || !statusNode || !progressNode) return;
+
+            let displayTokens = tokens >= 10000 ? (tokens / 1000).toFixed(1) + 'K' : tokens.toString();
+            countNode.textContent = `${displayTokens}`;
+
+            let percent = Math.min((tokens / THRESHOLDS.MAX) * 100, 100);
+            progressNode.style.width = `${percent}%`;
+
+            if (tokens < THRESHOLDS.STAGE_1) {
+                countNode.style.color = COLORS.GREEN; progressNode.style.backgroundColor = COLORS.GREEN;
+                statusNode.textContent = '🟢 极佳 / 逻辑清晰';
+            } else if (tokens < THRESHOLDS.STAGE_2) {
+                countNode.style.color = COLORS.YELLOW; progressNode.style.backgroundColor = COLORS.YELLOW;
+                statusNode.textContent = '🟡 良好 / 常规状态';
+            } else if (tokens < THRESHOLDS.STAGE_3) {
+                countNode.style.color = COLORS.ORANGE; progressNode.style.backgroundColor = COLORS.ORANGE;
+                statusNode.textContent = '🟠 疲劳 / 注意发散';
+            } else {
+                countNode.style.color = COLORS.RED; progressNode.style.backgroundColor = COLORS.RED;
+                statusNode.textContent = '🔴 混沌 / 建议新会话';
+            }
+        }
+
+        updateLucidity();
+
+        const observer = new MutationObserver(() => {
+            clearTimeout(window.lucidityTimer);
+            window.lucidityTimer = setTimeout(updateLucidity, 300);
+        });
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }
+
+    initDashboard();
+})();
